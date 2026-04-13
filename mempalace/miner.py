@@ -371,6 +371,43 @@ def chunk_text(content: str, source_file: str) -> list:
 # =============================================================================
 
 
+def _extract_entities_for_metadata(content: str) -> str:
+    """Extract entity names from content for metadata tagging.
+
+    Returns semicolon-separated string of entity names found in the text,
+    suitable for ChromaDB metadata filtering.
+    """
+    import re
+    # Load known entities from registry if available
+    known_names = set()
+    registry_path = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
+    if os.path.exists(registry_path):
+        try:
+            import json
+            kd = json.loads(open(registry_path).read())
+            for cat in kd.values():
+                if isinstance(cat, list):
+                    known_names.update(cat)
+        except Exception:
+            pass
+
+    matched = set()
+    # Match known entities
+    for name in known_names:
+        if re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', content):
+            matched.add(name)
+    # Also catch capitalized words appearing 2+ times (likely proper nouns)
+    words = re.findall(r"\b[A-Z][a-z]{2,}\b", content[:5000])
+    freq = {}
+    for w in words:
+        freq[w] = freq.get(w, 0) + 1
+    for w, c in freq.items():
+        if c >= 2 and len(w) > 2:
+            matched.add(w)
+
+    return ";".join(sorted(matched))[:500] if matched else ""
+
+
 def add_drawer(
     collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
 ):
@@ -390,6 +427,10 @@ def add_drawer(
             metadata["source_mtime"] = os.path.getmtime(source_file)
         except OSError:
             pass
+        # Tag with entity names for filterable search
+        entities = _extract_entities_for_metadata(content)
+        if entities:
+            metadata["entities"] = entities
         collection.upsert(
             documents=[content],
             ids=[drawer_id],
@@ -479,13 +520,17 @@ def process_file(
             ]
             closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
             closet_id_base = f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-            upsert_closet_lines(closets_col, closet_id_base, closet_lines, {
+            entities = _extract_entities_for_metadata(content)
+            closet_meta = {
                 "wing": wing,
                 "room": room,
                 "source_file": source_file,
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
-            })
+            }
+            if entities:
+                closet_meta["entities"] = entities
+            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room
 

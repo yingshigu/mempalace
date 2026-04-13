@@ -2,11 +2,14 @@
 """
 searcher.py — Find anything. Exact words.
 
-Semantic search against the palace.
-Returns verbatim text — the actual words, never summaries.
+Hybrid search: BM25 keyword matching + vector semantic similarity.
+Searches closets first (fast index), then hydrates full drawer content.
+Falls back to direct drawer search for palaces without closets.
 """
 
 import logging
+import math
+import re
 from pathlib import Path
 
 from .palace import get_collection, get_closets_collection
@@ -16,6 +19,59 @@ logger = logging.getLogger("mempalace_mcp")
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
+
+
+def _bm25_score(query: str, document: str, k1: float = 1.5, b: float = 0.75, avg_dl: float = 500) -> float:
+    """Simple BM25 score for a single document against a query.
+
+    This is a lightweight keyword-matching signal that complements vector
+    similarity. It catches exact matches that embeddings might miss
+    (e.g., specific names, project codes, error messages).
+    """
+    query_terms = set(re.findall(r'\w{2,}', query.lower()))
+    doc_terms = re.findall(r'\w{2,}', document.lower())
+    if not query_terms or not doc_terms:
+        return 0.0
+    doc_len = len(doc_terms)
+    term_freq = {}
+    for t in doc_terms:
+        term_freq[t] = term_freq.get(t, 0) + 1
+
+    score = 0.0
+    for term in query_terms:
+        tf = term_freq.get(term, 0)
+        if tf > 0:
+            # Simplified IDF — treat each query term as moderately rare
+            idf = math.log(2.0)
+            numerator = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * doc_len / avg_dl)
+            score += idf * numerator / denominator
+    return score
+
+
+def _hybrid_rank(vector_results, query: str, vector_weight: float = 0.6, bm25_weight: float = 0.4):
+    """Re-rank results using both vector distance and BM25 keyword score.
+
+    Returns results sorted by combined score (higher = better).
+    """
+    if not vector_results:
+        return vector_results
+
+    # Normalize vector distances to 0-1 similarity
+    max_dist = max(r.get("distance", 1.0) for r in vector_results) or 1.0
+    for r in vector_results:
+        vec_sim = max(0.0, 1 - r.get("distance", 1.0) / max(max_dist, 0.001))
+        bm25 = _bm25_score(query, r.get("text", ""))
+        # Normalize BM25 to roughly 0-1 range
+        bm25_norm = min(bm25 / 3.0, 1.0)
+        r["_hybrid_score"] = vector_weight * vec_sim + bm25_weight * bm25_norm
+        r["bm25_score"] = round(bm25, 3)
+
+    vector_results.sort(key=lambda r: r["_hybrid_score"], reverse=True)
+    # Clean up internal field
+    for r in vector_results:
+        del r["_hybrid_score"]
+    return vector_results
 
 
 def build_where_filter(wing: str = None, room: str = None) -> dict:
@@ -186,6 +242,8 @@ def search_memories(
                 break
 
         if hits:
+            # Re-rank with BM25 hybrid scoring
+            hits = _hybrid_rank(hits, query)
             return {
                 "query": query,
                 "filters": {"wing": wing, "room": room},
@@ -227,6 +285,8 @@ def search_memories(
             }
         )
 
+    # Re-rank with BM25 hybrid scoring
+    hits = _hybrid_rank(hits, query)
     return {
         "query": query,
         "filters": {"wing": wing, "room": room},
